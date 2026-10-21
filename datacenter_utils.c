@@ -1,4 +1,5 @@
 #include "datacenter_utils.h"
+#include "filesystem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -251,6 +252,23 @@ int spawn_all_vms(Reservation *res) {
 		VM *vm = res->vms[i];
 
 		// TODO: Implement fork code. Set VM PID and update VM state to running.
+
+		//Para cada VM da reserva o ciclo vai fazer três coisas
+		// 1 -> Criar pastas /tmp/CloudIST/<reserva>/<vm> com a criar_diretorios_por_reserva. O caminho final fica guardado em destino.
+		// 2 -> Copiar o Input, com a copy_dir. Copia a pasta que o comando D indicou (Input_folder do tipo de VM) para esse destino.
+		// 3 -> Deixar a VM Arrancar com a linha que já está la, spawn_vm_child(vm).
+
+		char destino[MAX_PATH_SIZE];
+
+		if(criar_diretorios_por_reserva(res->id, vm->id, destino, sizeof(destino)) != 0){
+			fprintf(stderr, "Fail to create the dir per reserve(ID): %s\n", vm->id);
+			return 1;
+		}
+
+		if(copy_dir(vm->type->input_folder, destino) != 0){
+			fprintf(stderr, "Fail to copy the dir per reserve(ID): %s\n", vm->id);
+			return 1;
+		}
 
 		spawn_vm_child(vm);
 
