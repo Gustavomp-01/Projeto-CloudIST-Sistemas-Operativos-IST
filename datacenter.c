@@ -5,6 +5,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 void datacenter_init(DataCenter *dc) {
   dc->servers = NULL;
@@ -15,6 +16,10 @@ void datacenter_init(DataCenter *dc) {
   dc->num_reservations = 0;
 
   dc->configured = 0;
+
+  dc->local_cores = 0;
+  
+  pthread_mutex_init(&dc->mutex, NULL);
 }
 
 void datacenter_destroy(DataCenter *dc) {
@@ -23,6 +28,7 @@ void datacenter_destroy(DataCenter *dc) {
       free(dc->servers[i].hosted_vms[j]);
     }
   }
+  pthread_mutex_destroy(&dc->mutex); // Destroi o mutex
   free(dc->servers);
 }
 
@@ -58,85 +64,148 @@ int datacenter_configure(DataCenter *dc, size_t num_servers, Resources *resource
 }
 
 int datacenter_define_VM(DataCenter *dc, VMType *type){
+  pthread_mutex_lock(&dc->mutex);
   if (!dc->configured) {
     fprintf(stderr, "Data Center needs to be configured!\n");
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
   }
 
   if(VMType_exists(dc, type->id) != NULL){
     fprintf(stderr, "VM type with id %s already exists.\n", type->id);
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
   }
 
   if (!file_exists(type->exec_path)) {
     fprintf(stderr, "Invalid executable path.\n");
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
   }
 
   if (!path_exists(type->input_folder)) {
     fprintf(stderr, "Invalid input folder.\n");
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
   }
 
   if(dc->num_vm_types >= MAX_VM_TYPES){
     fprintf(stderr, "Maximum of VM types reached.\n");
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
   }
   
   dc->vm_types[dc->num_vm_types++] = *type;
-
+  pthread_mutex_unlock(&dc->mutex);
   return 0;
 }
 
 int datacenter_reserve(DataCenter *dc, Reservation *reservation) {
+
+  pthread_mutex_lock(&dc->mutex);
+
   if (!dc->configured) {
     fprintf(stderr, "Data Center needs to be configured!\n");
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
   }
 
   if(reservation_validate(dc, reservation) != 0){
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
   }
 
   if (dc->num_reservations >= MAX_RESERVATIONS){
     fprintf(stderr, "Max number of reservations reached\n");
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
   }
 
-  if (reservation_commit(dc, reservation) != 0)
+  if (reservation_commit(dc, reservation) != 0){
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
+  }
 
   dc->reservations[dc->num_reservations] = *reservation;
   dc->num_reservations++;
+  pthread_mutex_unlock(&dc->mutex);
+
 
   return 0;
 }
 
+static Reservation *find_reservation(DataCenter *dc, const char *reservation_id){
+  for(size_t i = 0; i < dc->num_reservations; i++){ // For que corre toda a lista de reservas
+    // No caso de acharmos o Id que buscamos
+    if(strcmp(dc->reservations[i].id, reservation_id) == 0){ // Usamos o string comparation que devolve 0 se as strings forem iguais
+      return &dc->reservations[i]; // Retornamos o endereço da reserva
+    }
+  }
+  return NULL; // Se não tivermos encontrado a reserva devolvemos NULL
+}
+
 int datacenter_execute(DataCenter *dc, const char *reservation_id) {
+
+  pthread_mutex_lock(&dc->mutex);
+
   if(!dc->configured){
     fprintf(stderr, "Data Center needs to be configured!\n");
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
   }
 
   Reservation *res = find_pending_reservation(dc, reservation_id);
-  if (!res) return 1;
+  if (!res){
+    pthread_mutex_unlock(&dc->mutex);
+    return 1;
+  } 
 
-  if (spawn_all_vms(res) != 0) return 1;
+  if (spawn_all_vms(dc, res) != 0){
+    pthread_mutex_unlock(&dc->mutex);
+    return 1;
+  } 
 
   res->state = RES_STATE_RUNNING;
 
-  wait_for_all_vms(res);
+  // Copiar os ponteiros das VMs ainda com os locks
+  VM *copia_vms[MAX_RESERVATION_VMS];
+  size_t n = res->num_vms;
+  for(size_t i = 0; i < n; i++){
+    copia_vms[i] = res->vms[i];
+  }
 
-  res->state = RES_STATE_FINISHED;
+  // Precisamos dar unlock por que as outras threads precisam correr durante o wait
+  // Por isso copiamos os ponteiros das VMs para que em caso de mudança ou finalização de outra thread que altere o array, temos uma cópia.
+  pthread_mutex_unlock(&dc->mutex);
 
-  reservation_destroy(dc, res);
 
+  wait_for_all_vms(copia_vms, n);
+
+  pthread_mutex_lock(&dc->mutex);
+
+  Reservation *reserva_inicial = find_reservation(dc, reservation_id); // Buscamos a nossa reserva inicial
+
+  if(reserva_inicial == NULL){ // Aqui só aconteceria em caso de BUG que seria quando a reserva não fosse encontrada, e ela só poderia ser apagada por ela mesma ao fim e não antes.
+    pthread_mutex_unlock(&dc->mutex);
+    return 1;
+  }
+
+  // Fazemos um for para percorrer a lista de VMs e encontrar a VM que vai finalizar e colocamos o estado como terminated
+  for(size_t i = 0; i < reserva_inicial->num_vms; i ++){
+    reserva_inicial->vms[i]->state = VM_STATE_TERMINATED;
+  }
+
+  reserva_inicial->state = RES_STATE_FINISHED;
+  reservation_destroy(dc, reserva_inicial);
+  pthread_mutex_unlock(&dc->mutex);
   return 0;
 }
 
 int datacenter_list(DataCenter *dc) {
+  pthread_mutex_lock(&dc->mutex);
   if (!dc->configured) {
     fprintf(stderr, "Data Center needs to be configured!\n");
+    pthread_mutex_unlock(&dc->mutex);
     return 1;
   }
 
@@ -229,6 +298,7 @@ int datacenter_list(DataCenter *dc) {
   }
 
   printf("================================================================--------------------------\n\n");
+  pthread_mutex_unlock(&dc->mutex);
   return 0;
 }
 

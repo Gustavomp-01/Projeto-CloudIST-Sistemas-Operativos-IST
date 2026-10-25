@@ -3,10 +3,12 @@
 
 #include <stdio.h>
 #include <sys/types.h>
+#include <pthread.h>
 
 #include "resources.h"
 #include "constants.h"
 #include "filesystem.h"
+
 
 typedef struct VMType{
   char id[MAX_STRING_SIZE];        // Id of VM type. eg: "V1"
@@ -76,6 +78,9 @@ typedef struct DataCenter {
     size_t num_reservations;
 
 	int configured;		      // Wheter the datacenter is configured or not.
+    size_t local_cores;   // Cores da máquina local (usado na fórmula do CPULIMIT)
+
+    pthread_mutex_t mutex; // Inicialização do mutex para o Lock.
 } DataCenter;
 
 /**

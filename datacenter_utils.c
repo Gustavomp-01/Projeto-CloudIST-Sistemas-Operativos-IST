@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include <errno.h>
 
 VMType *VMType_exists(DataCenter *dc, const char* type_id){
 	for(size_t i = 0; i < dc->num_vm_types; i++){
@@ -239,19 +240,60 @@ void reservation_destroy(DataCenter *dc, Reservation *reservation) {
 	dc->num_reservations--;
 }
 
-void spawn_vm_child(VM *vm) {
-	(void)vm; // To avoid warning.
+void spawn_vm_child(VM *vm, const char *limite) {
+	struct rlimit lim; // Criamos uma caixa vazia chamada lim (rlimit) = É o nome do tipo de variável a ser guardado na struct.
 
-	// TODO: Limit RAM, DISK and use exec with cpulimit.
+	// Guardaremos rlim_cur e rlim_max na caixa lim
+	// Limite da RAM (RLIMIT_AS) em Bytes
 
-	fprintf(stderr, "VM execution not implemented in base version.\n");
+	// Os valores são iguais pois o processo filho não pode aumentar.
+	lim.rlim_cur = vm->type->required.ram << 30;
+	lim.rlim_max = vm->type->required.ram << 30;
+
+	// RLIMIT_AS -> Tamanho máximo de uma memória virtual de um processo (Espaço de endereços)
+	// Setrlimit() pega o valor limite que está em lim e seta o limite para a memória virtual a esse valor
+	// Limite memória virtual = lim
+	if(setrlimit(RLIMIT_AS,&lim) == -1){ // Em caso de erro ele retorna -1
+		fprintf(stderr, "Fail to set virtual memory limit to the VM %s\n", vm->id);
+		_exit(1); // O filho não pode terminar, então termina-se
+	}
+
+	// Limite de Disco (RLIMIT_FSIZE) em bytes
+	
+	// Agora vamos sobrescrever os valores da caixa lim
+	// Os valores são iguais pois o processo filho não pode aumentar.
+	lim.rlim_cur = vm->type->required.disk << 30;
+	lim.rlim_max = vm->type->required.disk << 30;
+
+
+	// RLIMIT_FSIZE -> Tamanho máximo em bytes de arquivos que um processo pode criar
+	// Setrlimit() pega o valor limite que está em lim e seta o limite para o disco a esse valor
+	// Limite de memória de disco = lim
+	if(setrlimit(RLIMIT_FSIZE,&lim) == -1){ // Em caso de erro ele retorna -1
+		fprintf(stderr, "Fail to set disk limit to the VM %s\n", vm->id);
+		_exit(1); // O filho não pode terminar, então termina-se
+	}
+
+
+
+	// exec do pacote CPULIMIT
+	//execlp(1º Programa a exec, 2º o argv[0] do programa novo, 3º -q (quiet) não escreve mensagens de estado
+	//execlp(4º -f (Foreground) o cpulimit fica a correr a espera que o programa a vm acabe, 5º e 6º -l e limite a percentagem máxima de CPU)
+	//execlp(7º "--" fim das opções do cpulimit, o que vem a seguir pertence ao programa da vm)
+	//execlp(8º vm->type->exec_path o programa da vm que o cpulimit lança e limita 9º NULL marca o fim da lista de argumentos)
+	execlp("cpulimit", "cpulimit", "-q", "-f", "-l", limite, "--", vm->type->exec_path, NULL);
+
+	// Só chega aqui se o exec falhar
+	perror("Exec cpulimit"); // perror escreve a mensagem inserida seguida do motivo do erro
+	_exit(1); // garante que se o exec falhar o filho morre ali
+
+
+	
 }
 
-int spawn_all_vms(Reservation *res) {
+int spawn_all_vms(DataCenter *dc, Reservation *res) { // Colocamos o novo parametro DC
 	for (size_t i = 0; i < res->num_vms; i++) {
-		VM *vm = res->vms[i];
-
-		// TODO: Implement fork code. Set VM PID and update VM state to running.
+		VM *vm = res->vms[i]; // Array de ponteiros para a VM
 
 		//Para cada VM da reserva o ciclo vai fazer três coisas
 		// 1 -> Criar pastas /tmp/CloudIST/<reserva>/<vm> com a criar_diretorios_por_reserva. O caminho final fica guardado em destino.
@@ -270,18 +312,71 @@ int spawn_all_vms(Reservation *res) {
 			return 1;
 		}
 
-		spawn_vm_child(vm);
+		// Porcentagem de CPU desta VM(Formula)
+		double limite = 100 * vm->type->required.cpu *(double)dc->local_cores / (vm->server->total.cpu *(double)dc->num_servers);
+		// constante -> 100  vCPUs                              local cores       CPU por server                   num de servers
+
+		char limite_str[32];
+
+		snprintf(limite_str, sizeof(limite_str), "%d", (int)(limite + 0.5)); 
+
+		// Basicamente o que acontece aqui é o seguinte, temos um processo Pai que é o "gestor do programa" é o CloudIST
+		// Esse processo pai vai ler os comandos .conf
+		// Reservar e lançar um filho para cada VM (fork)
+		// Esperar que os filhos acabem (waitpid)
+		// Devolver os recursos e apagar a reserva
+		// CADA VM(Virtual Machine) é um processo filho
+
+
+		pid_t pid = fork(); //Fork cria um novo processo duplicando o processo pai.
+		// Em caso de sucesso o Fork devolve 0 ao filho 
+		// O processo pai vai receber o PID do filho, PID > 0
+		// Em caso de erro ele retorna -1
+
+		if(pid < 0){ // Em caso de erro, onde PID = -1
+			fprintf(stderr, "Fork failed for VM %s\n", vm->id);
+			return 1;
+		}
+
+		else if(pid == 0){ // Aqui é o código para o processo filho
+			// A partir dessa parte o processo filho vai ser lançado para a sua VM
+			spawn_vm_child(vm, limite_str);
+			_exit(1);
+		}else{ // Aqui para o processo pai
+			
+			vm->pid = pid; // O pai guarda o PID do filho para que depois caso necessário possa "comunicar" com o processo filho. Será usado em funções como a de wait
+			vm->state = VM_STATE_RUNNING; // altera o estado da VM para running
+		}
+
 
 	}
 
 	return 0;
 }
 
-void wait_for_all_vms(Reservation *res) {
-	for (size_t i = 0; i < res->num_vms; i++) {
-		// TODO: IMPLEMENT WAITING FOR VM
 
-		res->vms[i]->state = VM_STATE_TERMINATED;
+// Essa função vai ser responsável por dar ao processo pai o feedback de finalização dos processos
+void wait_for_all_vms(VM **vms, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		VM *vm = vms[i]; // Array de ponteiros para a VM
+		int status; // Status recebe como que o filho terminou, código de saída ou sinal que o matou.
+
+
+		// Aqui esperamos que o processo termine.
+		if(waitpid(vm->pid, &status,0) == -1){ // Caso ocorra algum erro no waitpid()
+			fprintf(stderr, "Waitpid failed for vm (%s) pid %d: %s\n", vm->id, (int)vm->pid, strerror(errno));
+
+		}else{// Caso não ocarra nenhum erro teremos certeza que o processo fiho terminou. Logo podemos mudar o estado para terminado.
+
+			if (WIFEXITED(status)) {
+    			if (WEXITSTATUS(status) != 0) {
+        			fprintf(stderr, "VM %s terminou com código %d\n", vm->id, WEXITSTATUS(status));
+    		}
+				} else if (WIFSIGNALED(status)) {
+    				fprintf(stderr, "VM %s foi terminada pelo sinal %d\n", vm->id, WTERMSIG(status));
+			}
+		}
+
 	}
 }
 
