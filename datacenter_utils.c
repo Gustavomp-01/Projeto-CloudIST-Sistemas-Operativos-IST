@@ -193,33 +193,45 @@ Reservation *find_pending_reservation(DataCenter *dc, const char *reservation_id
 	return res;
 }
 
-void reservation_destroy(DataCenter *dc, Reservation *reservation) {
-	// Free every VM belonging to the reservation.
-	for (size_t i = 0; i < reservation->num_vms; i++) {
-		VM *vm = reservation->vms[i];
-		Server *server = vm->server;
+// Destrói UMA VM: devolve recursos, tira-a do servidor e da reserva, liberta-a.
+void vm_destroy(Reservation *reservation, VM *vm){
+	Server *server = vm->server;
 
-		// Return the VM resources back to the hosting server.
-		resources_add(&server->available, vm->type->required);
+	// Return the VM resources back to the hosting server.
+	resources_add(&server->available, vm->type->required);
 
-		// Remove the VM from the server's hosted VM list.
-		for (size_t j = 0; j < server->num_hosted_vms; j++) {
-			if (server->hosted_vms[j] == vm) {
-				// Shift the remaining VMs one position to the left.
-				memmove(&server->hosted_vms[j],
-								&server->hosted_vms[j + 1],
-								(server->num_hosted_vms - j - 1) * sizeof(VM *));
+	
+	// Remove the VM from the server's hosted VM list.
+	for (size_t j = 0; j < server->num_hosted_vms; j++) {
+		if (server->hosted_vms[j] == vm) {
+			// Shift the remaining VMs one position to the left.
+			memmove(&server->hosted_vms[j],
+						&server->hosted_vms[j + 1],
+							(server->num_hosted_vms - j - 1) * sizeof(VM *));
 
 				server->num_hosted_vms--;
 				break;
 			}
 		}
 
-		free(vm);
-		reservation->vms[i] = NULL;
-	}
+	// Remove the VM from the reservation's VM array.
+	for (size_t i = 0; i < reservation->num_vms; i++) {
+		if (reservation->vms[i] == vm) {
+			// Shift the remaining VMs one position to the left.
+			memmove(&reservation->vms[i],
+					&reservation->vms[i + 1],
+					(reservation->num_vms - i - 1) * sizeof(VM *));
 
-	reservation->num_vms = 0;
+			reservation->num_vms--;
+			reservation->vms[reservation->num_vms] = NULL;
+			break;
+		}
+	}
+	free(vm);	
+}
+
+// Tira a reserva da lista do datacenter (assume que já não tem VMs).
+void reservation_remove(DataCenter *dc, Reservation *reservation){
 
 	// Find the reservation inside the Data Center reservation list.
 	size_t idx;
@@ -238,7 +250,9 @@ void reservation_destroy(DataCenter *dc, Reservation *reservation) {
 					(dc->num_reservations - idx - 1) * sizeof(Reservation));
 
 	dc->num_reservations--;
+
 }
+
 
 void spawn_vm_child(VM *vm, const char *limite) {
 	struct rlimit lim; // Criamos uma caixa vazia chamada lim (rlimit) = É o nome do tipo de variável a ser guardado na struct.
@@ -318,14 +332,18 @@ int spawn_all_vms(DataCenter *dc, Reservation *res) { // Colocamos o novo parame
 
 		char limite_str[32];
 
-		snprintf(limite_str, sizeof(limite_str), "%d", (int)(limite + 0.5)); 
+		
+		int limite_int = (int)(limite + 0.5);
+		
+		if (limite_int < 1) {
+			limite_int = 1;
+		}
+		
+		snprintf(limite_str, sizeof(limite_str), "%d", limite_int);
 
-		// Basicamente o que acontece aqui é o seguinte, temos um processo Pai que é o "gestor do programa" é o CloudIST
-		// Esse processo pai vai ler os comandos .conf
-		// Reservar e lançar um filho para cada VM (fork)
-		// Esperar que os filhos acabem (waitpid)
-		// Devolver os recursos e apagar a reserva
-		// CADA VM(Virtual Machine) é um processo filho
+		// O processo pai (CloudIST) continua a ler os comandos dos .conf.
+		// Aqui só lança um filho por VM (fork); quem espera por elas (waitpid)
+		// e destrói cada VM quando termina são as vigias, criadas no datacenter_execute.
 
 
 		pid_t pid = fork(); //Fork cria um novo processo duplicando o processo pai.
@@ -354,31 +372,27 @@ int spawn_all_vms(DataCenter *dc, Reservation *res) { // Colocamos o novo parame
 	return 0;
 }
 
+// Espera que a VM com este pid termine e avisa se falhou.
+void wait_for_vm(pid_t pid, const char *vm_id){
+	int status;
 
-// Essa função vai ser responsável por dar ao processo pai o feedback de finalização dos processos
-void wait_for_all_vms(VM **vms, size_t n) {
-	for (size_t i = 0; i < n; i++) {
-		VM *vm = vms[i]; // Array de ponteiros para a VM
-		int status; // Status recebe como que o filho terminou, código de saída ou sinal que o matou.
-
-
-		// Aqui esperamos que o processo termine.
-		if(waitpid(vm->pid, &status,0) == -1){ // Caso ocorra algum erro no waitpid()
-			fprintf(stderr, "Waitpid failed for vm (%s) pid %d: %s\n", vm->id, (int)vm->pid, strerror(errno));
+	// Aqui esperamos que o processo termine.
+		if(waitpid(pid, &status,0) == -1){ // Caso ocorra algum erro no waitpid()
+			fprintf(stderr, "Waitpid failed for vm (%s) pid %d: %s\n", vm_id, (int)pid, strerror(errno));
 
 		}else{// Caso não ocarra nenhum erro teremos certeza que o processo fiho terminou. Logo podemos mudar o estado para terminado.
 
 			if (WIFEXITED(status)) {
     			if (WEXITSTATUS(status) != 0) {
-        			fprintf(stderr, "VM %s terminou com código %d\n", vm->id, WEXITSTATUS(status));
+        			fprintf(stderr, "VM %s terminou com código %d\n", vm_id, WEXITSTATUS(status));
     		}
 				} else if (WIFSIGNALED(status)) {
-    				fprintf(stderr, "VM %s foi terminada pelo sinal %d\n", vm->id, WTERMSIG(status));
+    				fprintf(stderr, "VM %s foi terminada pelo sinal %d\n", vm_id, WTERMSIG(status));
 			}
 		}
 
-	}
 }
+
 
 const char *vm_state_to_string(VMState state) {
     switch (state) {

@@ -5,10 +5,10 @@
 
 /**
  * Checks if a VMType with the given id exists.
- * 
+ *
  * @param dc Pointer to Data Center.
  * @param type_id Id of VM type being checked.
- * 
+ *
  * @return Pointer to VMType if it exists.
  * @return NULL if VMType does not exist.
  */
@@ -20,7 +20,7 @@ VMType *VMType_exists(DataCenter *dc, const char* type_id);
  * is left unchanged regardless of the outcome.
  *
  * Validation fails if any requested server does not have enough available
- * resources to host all the requested VMs assigned to it or if the request 
+ * resources to host all the requested VMs assigned to it or if the request
  * does not have valid parameters (VM types that do not exist, invalid server ids).
  *
  * @param dc Data Center where the reservation will be validated.
@@ -61,15 +61,23 @@ int reservation_commit(DataCenter *dc, Reservation *reservation);
 Reservation *find_pending_reservation(DataCenter *dc, const char *reservation_id);
 
 /**
- * Frees every VM allocated to the reservation, returns their resources to the
- * corresponding hosting servers, removes them from each server's hosted VM
- * list, and finally removes the reservation from the Data Center reservation
- * list.
+ * Destroys a single VM: returns its resources to the hosting server,
+ * removes it from the server's hosted VM list and from the reservation's
+ * VM array, and frees it.
  *
- * @param dc Pointer to the Data Center containing the reservation.
- * @param reservation Pointer to the reservation to destroy.
+ * @param reservation Pointer to the reservation that contains the VM.
+ * @param vm Pointer to the VM being destroyed.
  */
-void reservation_destroy(DataCenter *dc, Reservation *reservation);
+void vm_destroy(Reservation *reservation, VM *vm);
+
+/**
+ * Removes a reservation from the Data Center reservation list.
+ * Assumes the reservation no longer has any VMs.
+ *
+ * @param dc Pointer to the Data Center.
+ * @param reservation Pointer to the reservation being removed.
+ */
+void reservation_remove(DataCenter *dc, Reservation *reservation);
 
 /**
  * Runs in the child process after fork(): sets resource limits (RAM,
@@ -92,12 +100,13 @@ void spawn_vm_child(VM *vm, const char *limite);
 int spawn_all_vms(DataCenter*dc, Reservation *res);
 
 /**
- * Blocks until every VM's process has exited, updating each VM's state
- * to VM_STATE_TERMINATED as its pid is reaped.
+ * Waits for the process with the given pid to terminate and reports
+ * if it exited with a non-zero code or was killed by a signal.
  *
- * @param res Pointer to the Reservation whose VMs should be waited on.
+ * @param pid Pid of the VM process.
+ * @param vm_id Id of the VM (used in messages).
  */
-void wait_for_all_vms(VM **vms, size_t n);
+void wait_for_vm(pid_t pid, const char *vm_id);
 
 /**
  * Converts a VM state to a human-readable string. Used by datacenter_list().

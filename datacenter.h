@@ -81,6 +81,9 @@ typedef struct DataCenter {
     size_t local_cores;   // Cores da máquina local (usado na fórmula do CPULIMIT)
 
     pthread_mutex_t mutex; // Inicialização do mutex para o Lock.
+    size_t monitores_ativos; // Contador de monitores ativos
+    pthread_cond_t cond_monitores; // Acorda o main quando o vigia termina
+
 } DataCenter;
 
 /**

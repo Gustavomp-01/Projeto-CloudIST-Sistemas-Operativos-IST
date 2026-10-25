@@ -18,16 +18,26 @@ void datacenter_init(DataCenter *dc) {
   dc->configured = 0;
 
   dc->local_cores = 0;
-  
+
   pthread_mutex_init(&dc->mutex, NULL);
+  dc->monitores_ativos = 0;
+  pthread_cond_init(&dc->cond_monitores, NULL);
 }
 
 void datacenter_destroy(DataCenter *dc) {
+  pthread_mutex_lock(&dc->mutex);
+  // Enquanto ainda estivermos com monitores ativos
+  while(dc->monitores_ativos != 0){
+    pthread_cond_wait(&dc->cond_monitores, &dc->mutex); // Esperamos que os monitores finalizem
+  }
+  pthread_mutex_unlock(&dc->mutex);
   for (size_t i = 0; i < dc->num_servers; i++) {
     for(size_t j = 0; j < dc->servers[i].num_hosted_vms; j++){
       free(dc->servers[i].hosted_vms[j]);
     }
   }
+
+  pthread_cond_destroy(&dc->cond_monitores);
   pthread_mutex_destroy(&dc->mutex); // Destroi o mutex
   free(dc->servers);
 }
@@ -144,6 +154,44 @@ static Reservation *find_reservation(DataCenter *dc, const char *reservation_id)
   return NULL; // Se não tivermos encontrado a reserva devolvemos NULL
 }
 
+typedef struct {
+    DataCenter *dc;
+    VM *vm;
+    pid_t pid;
+    char reservation_id[MAX_STRING_SIZE];
+    char vm_id[MAX_VM_ID_STRING];
+} vigia_arg;
+
+static void *vigia(void *arg){
+  
+  vigia_arg *a = (vigia_arg *)arg;
+
+  // 1. Espera pela VM, SEM lock
+  wait_for_vm(a->pid, a->vm_id);
+
+
+  // 2. Agora sim, toma o lock para mexer nas estruturas partilhadas
+  pthread_mutex_lock(&a->dc->mutex);
+
+  Reservation *res = find_reservation(a->dc, a->reservation_id);
+
+  if (res != NULL) {
+    vm_destroy(res, a->vm);
+    if (res->num_vms == 0) { 
+      reservation_remove(a->dc, res);
+    }
+  }
+
+  // 3. Esta vigia acabou: desce o contador e toca a campainha
+  a->dc->monitores_ativos--;
+  pthread_cond_broadcast(&a->dc->cond_monitores);
+  pthread_mutex_unlock(&a->dc->mutex);
+
+  free(a);
+  return NULL;
+
+}
+
 int datacenter_execute(DataCenter *dc, const char *reservation_id) {
 
   pthread_mutex_lock(&dc->mutex);
@@ -167,39 +215,51 @@ int datacenter_execute(DataCenter *dc, const char *reservation_id) {
 
   res->state = RES_STATE_RUNNING;
 
-  // Copiar os ponteiros das VMs ainda com os locks
-  VM *copia_vms[MAX_RESERVATION_VMS];
-  size_t n = res->num_vms;
-  for(size_t i = 0; i < n; i++){
-    copia_vms[i] = res->vms[i];
+  // Para cada VM da reserva criamos uma "vigia" (thread) que espera por ela
+  // Assim o A volta logo ao processo que lê os comandos e as VMs correm em paralelo
+  for (size_t i = 0; i < res->num_vms; i++) {
+    VM *vm = res->vms[i];
+
+    // A vigia precisa de uma struct que continue a existir depois do execute retornar,
+    // por isso usamos malloc (uma variável local desaparecia). O free é feito pela própria vigia.
+    vigia_arg *a = malloc(sizeof(vigia_arg));
+    if (a == NULL) {
+      fprintf(stderr, "Failed to allocate monitor for VM %s\n", vm->id);
+      continue;
+    }
+
+    a->dc  = dc;
+    a->vm  = vm;       // O ponteiro da VM é estável, só esta vigia a vai libertar
+    a->pid = vm->pid;  // Copiamos o pid para a vigia esperar sem tocar na VM partilhada
+
+    // Copiamos os ids para dentro da struct. O ponteiro da Reservation pode deixar de ser
+    // válido (o memmove do reservation_remove desloca o array), mas o id copiado continua a servir
+    // para voltar a procurar a reserva com o find_reservation.
+    snprintf(a->reservation_id, sizeof(a->reservation_id), "%s", res->id);
+    snprintf(a->vm_id, sizeof(a->vm_id), "%s", vm->id);
+
+    // Sobe ANTES de criar a thread, com o lock tomado. Assim o main (no destroy) nunca vê 0
+    // quando já existe uma vigia a caminho.
+    dc->monitores_ativos++;
+
+    pthread_t tid;
+    // Criar a thread com o lock tomado é seguro: a vigia só mexe nas estruturas depois de
+    // esperar pela VM e tomar o lock, ou seja, só depois de o execute fazer unlock.
+    if (pthread_create(&tid, NULL, vigia, a) != 0) {
+      fprintf(stderr, "Failed to create monitor for VM %s\n", vm->id);
+      dc->monitores_ativos--; // Desfazemos o que subimos, esta vigia não vai existir
+      free(a);
+      continue;
+    }
+    // Ninguém vai fazer pthread_join a estas threads, por isso ficam "detached":
+    // os recursos delas são libertados automaticamente quando terminam.
+    pthread_detach(tid);
   }
 
-  // Precisamos dar unlock por que as outras threads precisam correr durante o wait
-  // Por isso copiamos os ponteiros das VMs para que em caso de mudança ou finalização de outra thread que altere o array, temos uma cópia.
-  pthread_mutex_unlock(&dc->mutex);
-
-
-  wait_for_all_vms(copia_vms, n);
-
-  pthread_mutex_lock(&dc->mutex);
-
-  Reservation *reserva_inicial = find_reservation(dc, reservation_id); // Buscamos a nossa reserva inicial
-
-  if(reserva_inicial == NULL){ // Aqui só aconteceria em caso de BUG que seria quando a reserva não fosse encontrada, e ela só poderia ser apagada por ela mesma ao fim e não antes.
-    pthread_mutex_unlock(&dc->mutex);
-    return 1;
-  }
-
-  // Fazemos um for para percorrer a lista de VMs e encontrar a VM que vai finalizar e colocamos o estado como terminated
-  for(size_t i = 0; i < reserva_inicial->num_vms; i ++){
-    reserva_inicial->vms[i]->state = VM_STATE_TERMINATED;
-  }
-
-  reserva_inicial->state = RES_STATE_FINISHED;
-  reservation_destroy(dc, reserva_inicial);
   pthread_mutex_unlock(&dc->mutex);
   return 0;
 }
+
 
 int datacenter_list(DataCenter *dc) {
   pthread_mutex_lock(&dc->mutex);
